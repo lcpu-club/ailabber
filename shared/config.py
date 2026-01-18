@@ -4,7 +4,9 @@ from pathlib import Path
 
 # ============ 服务端口 ============
 LOCAL_PROXY_PORT = 8080
+LOCAL_FRPC_PORT = 7000
 REMOTE_SERVER_PORT = 8080
+REMOTE_FRPS_PORT = 7000
 
 # ============ 日志配置 ============
 LOG_LEVEL_CONSOLE = INFO
