@@ -1,0 +1,13 @@
+[project]
+name = "ailabber"
+version = "0.1.0"
+description = "AI Lab 分布式任务提交系统"
+requires-python = ">=3.10"
+dependencies = [
+    "flask>=3.1.2",
+    "requests>=2.32.5",
+    "sqlalchemy>=2.0.45",
+]
+
+
+
