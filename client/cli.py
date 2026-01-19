@@ -334,8 +334,8 @@ def cmd_help(args):
   list [status]                         列出我的任务
                                         可选 status: pending, running, completed, failed 等
   
-  fetch <task_id>                       下载任务日志和结果
-    [output_dir]                        可选指定输出目录，默认为当前目录
+  fetch <task_id> [output_dir]          下载任务日志和结果
+                                        可选指定输出目录，默认为当前目录
   
   cancel <task_id>                      取消任务
   

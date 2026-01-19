@@ -138,6 +138,10 @@ def submit_task():
         username = data['username']
         upload_path = data['upload']
         ignore_patterns = data.get('ignore', [])
+        target = data.get('target', 'local')
+        workdir = data.get('workdir', '.')
+        logs_list = data.get('logs', []) or []
+        results_list = data.get('results', []) or []
         
         # 创建上传压缩包
         try:
@@ -167,7 +171,12 @@ def submit_task():
                 username=username,
                 name=data.get('name', f"task_{task_id}"),
                 status="pending",
+                target=target,
                 command=command_str,
+                workdir=workdir,
+                logs_path=json.dumps(logs_list, ensure_ascii=False),
+                results_path=json.dumps(results_list, ensure_ascii=False),
+                archive_path=archive_path,
                 gpus=data.get('gpus', 1),
                 cpus=data.get('cpus', 4),
                 memory=data.get('memory', '8G'),
@@ -202,7 +211,11 @@ def submit_task():
                     "gpus": data.get('gpus', 1),
                     "cpus": data.get('cpus', 4),
                     "memory": data.get('memory', '8G'),
-                    "time_limit": data.get('time_limit', '1:00:00')
+                    "time_limit": data.get('time_limit', '1:00:00'),
+                    "target": target,
+                    "workdir": workdir,
+                    "logs": logs_list,
+                    "results": results_list
                 }),
                 created_at=datetime.now()
             )
@@ -217,7 +230,8 @@ def submit_task():
             
             return jsonify({
                 "task_id": task_id,
-                "message": f"任务 {task_id} 已成功提交"
+                "message": f"任务 {task_id} 已成功提交",
+                "target": target
             }), 200
             
         except Exception as e:

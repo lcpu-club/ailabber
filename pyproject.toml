@@ -6,6 +6,7 @@ requires-python = ">=3.10"
 dependencies = [
     "flask>=3.1.2",
     "requests>=2.32.5",
+    "shortuuid>=1.0.13",
     "sqlalchemy>=2.0.45",
 ]
 
