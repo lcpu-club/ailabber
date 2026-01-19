@@ -10,29 +10,35 @@ pyproject_toml = "./pyproject.toml"
 uv_lock = "./uv.lock"
 # 额外的 wheel 文件（本地路径）
 extra_wheels = [
-    "./dist/my_custom_op-0.1.0-cp310-linux_x86_64.whl"
+    # "./dist/my_custom_op-0.1.0-cp310-linux_x86_64.whl"
 ]
 
-[push]
+[submit]
 # 需要同步到远端的数据
 upload = "."
+# 忽略的文件/目录
 ignore = [
-    "./__pycache__/"
+    "./__pycache__/",
+    "./.git/",
+    "./ailabber/",
+    "./.venv/",
+    "./.vscode/"
 ]
 
 [run]
 # 工作目录（相对于同步后的项目根目录）
 workdir = "."
-# 运行命令
+# 运行命令（按顺序执行）
 commands = [
     "python train.py --config configs/resnet50.yaml"
 ]
 
 [fetch]
-# 日志、结果路径
+# 日志路径（用于fetch）
 logs = [
     "./logs"
 ]
+# 结果路径（用于fetch）
 results = [
     "./output"
 ]

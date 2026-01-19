@@ -58,10 +58,10 @@ def cmd_submit(args) -> str:
             task_config = tomllib.load(f)
     except FileNotFoundError:
         print(f"ERROR: 任务配置文件未找到: {config_path}")
-        return None
+        return ""
     except tomllib.TOMLDecodeError as e:
         print(f"ERROR: 任务配置文件解析失败: {e}")
-        return None
+        return ""
     
     # 验证必要的配置字段
     required_keys = {
@@ -74,26 +74,26 @@ def cmd_submit(args) -> str:
     for section, keys in required_keys.items():
         if section not in task_config:
             print(f"ERROR: 配置文件缺少 [{section}] 部分")
-            return None
+            return ""
         for key in keys:
             if key not in task_config[section]:
                 print(f"ERROR: [{section}] 缺少 {key} 配置")
-                return None
+                return ""
     
     # 提交任务到本地代理服务器
     try:
         resp = requests.post(f"{LOCAL_PROXY_URL}/api/submit", json={
             "username": current_username,
             "target": target,
-            "pyproject_toml": task_config["environment"]["pyproject_toml"],
-            "uv_lock": task_config["environment"]["uv_lock"],
-            "extra_wheels": task_config["environment"].get("extra_wheels", []),
-            "upload": str(Path(task_config["files"]["upload"]).resolve()),
-            "ignore": [str(Path(ig).resolve()) for ig in task_config["files"]["ignore"]],
-            "workdir": task_config["files"]["workdir"],
+            "pyproject_toml": str(Path(task_config["environment"]["pyproject_toml"]).resolve()),
+            "uv_lock": str(Path(task_config["environment"]["uv_lock"]).resolve()),
+            "extra_wheels": [str(Path(w).resolve()) for w in task_config["environment"].get("extra_wheels", [])],
+            "upload": str(Path(task_config["submit"]["upload"]).resolve()),
+            "ignore": [str(Path(ig).resolve()) for ig in task_config["submit"]["ignore"]],
+            "workdir": task_config["run"]["workdir"],
             "commands": task_config["run"]["commands"],
-            "logs": task_config["run"]["logs"],
-            "results": task_config["run"]["results"],
+            "logs": task_config["fetch"]["logs"],
+            "results": task_config["fetch"]["results"],
             "gpus": task_config["resources"]["gpus"],
             "cpus": task_config["resources"]["cpus"],
             "memory": task_config["resources"]["memory"],
@@ -110,19 +110,22 @@ def cmd_submit(args) -> str:
         else:
             print("ERROR: 任务提交失败")
             print(f"\t{data.get('message', data.get('error', '未知错误'))}")
-            return None
+            return ""
             
     except requests.exceptions.ConnectionError:
         print(f"ERROR: 无法连接到 {LOCAL_PROXY_URL}")
         print("  请确保本地代理服务器正在运行")
-        return None
+        return ""
     except requests.exceptions.HTTPError as e:
         print(f"ERROR: HTTP 错误 {resp.status_code}")
         print(f"\t{resp.json().get('message', str(e))}")
-        return None
+        return ""
+    except KeyError as e:
+        print(f"ERROR: 缺少关键Config: {e}")
+        return ""
     except Exception as e:
         print(f"ERROR: 提交任务失败: {e}")
-        return None
+        return ""
 
 
 def cmd_status(args):

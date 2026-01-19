@@ -2,28 +2,54 @@
 """
 Local Proxy Server - 本地代理服务器
 
-接收 CLI 请求，管理任务队列，与远程服务器通信
+功能：
+1. 接收 CLI 任务提交请求
+2. 本地任务：通过本地 Slurm 调度
+3. 远程任务：同步文件到远程服务器，调用远程 API 提交 Slurm
+4. 后台轮询任务状态
 """
-import os
 import json
 import zipfile
 import tempfile
-import hashlib
+import shutil
+import subprocess
+import threading
+import time
+import requests
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 from flask import Flask, request, jsonify, send_file
 
-from shared.config import LOCAL_PROXY_PORT, REMOTE_SERVER_PORT
+from shared.config import (
+    LOCAL_PROXY_PORT, 
+    REMOTE_SERVER_PORT,
+    REMOTE_SSH_HOST,
+    REMOTE_SSH_PORT,
+    REMOTE_SSH_USER,
+    SSH_PRIVATE_KEY,
+    REMOTE_BASE_DIR,
+    REMOTE_SERVER_URL,
+    LOCAL_TMP_DIR,
+    POLL_INTERVAL
+)
 from shared.database import (
     init_local_db, 
     get_local_session, 
     TaskModel, 
     UserModel,
-    MessageLogModel
+    MessageLogModel,
+    Session
 )
-from shared.logger import get_logger
+from utils.logger import get_logger
+from utils.slurm import (
+    generate_slurm_script,
+    submit_slurm_job,
+    get_slurm_job_status,
+    cancel_slurm_job,
+    map_slurm_state,
+    read_slurm_output
+)
 
 # 初始化日志
 logger = get_logger("local_proxy")
@@ -34,64 +60,471 @@ app = Flask(__name__)
 # 初始化数据库
 init_local_db()
 
+# 轮询线程控制
+polling_thread = None
+polling_stop_event = threading.Event()
+
 
 # ============ 辅助函数 ============
 
-def create_upload_archive(upload_path: str, ignore_patterns: list[str]) -> tuple[str, str]:
+
+def safe_update_task(session: Session, task: TaskModel, **kwargs):
+    """安全更新任务字段"""
+    try:
+        for key, value in kwargs.items():
+            if hasattr(task, key):
+                setattr(task, key, value)
+        task.updated_at = datetime.now()
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        logger.error(f"更新任务失败: {task.task_id} - {e}")
+
+
+def copy_uploads_to_tmp(username: str, upload_path: str, ignore_patterns: list[str]) -> str:
     """
-    创建上传文件的压缩包
+    将上传文件复制到本地临时目录
     
     Args:
+        username: 用户名
         upload_path: 上传目录路径
         ignore_patterns: 忽略的文件/目录列表
         
     Returns:
-        (archive_path, archive_hash): 压缩包路径和哈希值
+        tmp_path: 临时目录路径 (LOCAL_TMP_DIR/username)
     """
     upload_dir = Path(upload_path)
     if not upload_dir.exists():
-        raise FileNotFoundError(f"上传目录不存在: {upload_path}")
+        logger.error(f"{username} - upload_dir does not exist: {upload_path}")
+        return ""
     
-    # 创建临时压缩文件
-    temp_dir = Path(tempfile.gettempdir()) / "ailabber_uploads"
-    temp_dir.mkdir(parents=True, exist_ok=True)
+    # 创建用户临时目录
+    tmp_dir = LOCAL_TMP_DIR / username
     
-    archive_path = temp_dir / f"upload_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+    # 如果目录已存在，先清空
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
     
     # 将 ignore_patterns 转换为绝对路径集合
     ignore_set = set(Path(p).resolve() for p in ignore_patterns if p)
     
-    with zipfile.ZipFile(archive_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for file_path in upload_dir.rglob('*'):
-            # 检查是否应该忽略
-            if file_path.resolve() in ignore_set:
-                continue
-            # 检查父目录是否在忽略列表
-            should_ignore = False
-            for parent in file_path.parents:
-                if parent.resolve() in ignore_set:
-                    should_ignore = True
-                    break
-            if should_ignore:
-                continue
+    def should_ignore(file_path: Path) -> bool:
+        """检查文件是否应该被忽略"""
+        # 检查文件本身
+        if file_path.resolve() in ignore_set:
+            return True
+        # 检查父目录
+        for parent in file_path.parents:
+            if parent.resolve() in ignore_set:
+                return True
+        return False
+    
+    # 复制文件
+    for file_path in upload_dir.rglob('*'):
+        if should_ignore(file_path):
+            continue
+        
+        rel_path = file_path.relative_to(upload_dir)
+        target_path = tmp_dir / rel_path
+        
+        if file_path.is_dir():
+            target_path.mkdir(parents=True, exist_ok=True)
+        elif file_path.is_file():
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(file_path, target_path)
+    
+    logger.info(f"{username} - files copied to tmp dir: {tmp_dir}")
+    return str(tmp_dir)
+
+
+def rsync_to_remote(username: str, local_path: str) -> bool:
+    """
+    使用 rsync 将本地目录同步到远程服务器
+    
+    Args:
+        username: 用户名
+        local_path: 本地目录路径
+        
+    Returns:
+        success: 是否成功
+    """
+    # 远程目标路径: /home/{username}/
+    remote_path = (Path(REMOTE_BASE_DIR) / username).as_posix() + "/"
+    
+    # 构建 rsync 命令
+    rsync_cmd = "rsync -avz -e 'ssh -i {ssh_key} -p {ssh_port} -o StrictHostKeyChecking=no' {local}/ {user}@{host}:{remote}".format(
+        ssh_key=SSH_PRIVATE_KEY,
+        ssh_port=REMOTE_SSH_PORT,
+        local=local_path,
+        user=REMOTE_SSH_USER,
+        host=REMOTE_SSH_HOST,
+        remote=remote_path
+    )
+    logger.info(f"{username} - rsync: {rsync_cmd}")
+    
+    try:
+        result = subprocess.run(
+            rsync_cmd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=3600  # 1小时超时
+        )
+        
+        if result.returncode == 0:
+            logger.info(f"{username} - rsync success: {local_path} -> {remote_path}")
+            return True
+        else:
+            logger.error(f"{username} - rsync failed: {result.stderr}")
+            return False
             
-            if file_path.is_file():
-                arcname = file_path.relative_to(upload_dir)
-                zf.write(file_path, arcname)
+    except subprocess.TimeoutExpired:
+        logger.error(f"{username} - rsync timeout")
+        return False
+    except Exception as e:
+        logger.error(f"{username} - rsync exception: {e}")
+        return False
+
+
+def rsync_from_remote(username: str, remote_paths: list[str], local_dest: str, workdir: str = ".") -> bool:
+    """
+    从远程服务器同步文件到本地
     
-    # 计算哈希值
-    with open(archive_path, 'rb') as f:
-        archive_hash = hashlib.sha256(f.read()).hexdigest()[:16]
+    Args:
+        username: 用户名
+        remote_paths: 远程路径列表（相对于工作目录）
+        local_dest: 本地目标目录
+        workdir: 远程工作目录
+        
+    Returns:
+        success: 是否成功
+    """
+    user_base = Path(REMOTE_BASE_DIR) / username
+    if workdir.startswith('/'):
+        work_path = Path(workdir)
+    else:
+        work_path = user_base / workdir
     
-    return str(archive_path), archive_hash
+    success = True
+    for rel_path in remote_paths:
+        remote_full = (work_path / rel_path).as_posix()
+        
+        rsync_cmd = "rsync -avz -e 'ssh -i {ssh_key} -p {ssh_port} -o StrictHostKeyChecking=no' {user}@{host}:{remote} {local}/".format(
+            ssh_key=SSH_PRIVATE_KEY,
+            ssh_port=REMOTE_SSH_PORT,
+            user=REMOTE_SSH_USER,
+            host=REMOTE_SSH_HOST,
+            remote=remote_full,
+            local=local_dest
+        )
+        
+        try:
+            result = subprocess.run(
+                rsync_cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=3600
+            )
+            
+            if result.returncode != 0:
+                logger.error(f"rsync from remote failed: {result.stderr}")
+                success = False
+        except Exception as e:
+            logger.error(f"rsync from remote exception: {e}")
+            success = False
+    
+    return success
 
 
-def generate_msg_id() -> str:
-    """生成消息 ID"""
-    import uuid
-    return str(uuid.uuid4())[:16]
+# ============ 本地 Slurm 提交 ============
+
+def submit_local_slurm(session: Session, task: TaskModel, data: dict):
+    """
+    本地 Slurm 作业提交
+    """
+    username = data['username']
+    task_id = task.task_id
+    
+    try:
+        # 确定工作目录
+        upload_path = Path(data.get('upload', '.'))
+        workdir = data.get('workdir', '.')
+        
+        if workdir.startswith('/'):
+            work_path = Path(workdir)
+        else:
+            work_path = upload_path / workdir if upload_path.exists() else Path(workdir)
+        
+        work_path = work_path.resolve()
+        work_path.mkdir(parents=True, exist_ok=True)
+        
+        # Slurm 输出目录
+        slurm_dir = work_path / ".slurm"
+        slurm_dir.mkdir(exist_ok=True)
+        
+        output_file = str(slurm_dir / f"{task_id}.out")
+        error_file = str(slurm_dir / f"{task_id}.err")
+        script_file = str(slurm_dir / f"{task_id}.sh")
+        
+        # 解析命令
+        commands = data.get('commands', [])
+        if isinstance(commands, str):
+            commands = commands.split(' && ')
+        
+        # 生成 Slurm 脚本
+        script_content = generate_slurm_script(
+            task_id=task_id,
+            username=username,
+            workdir=str(work_path),
+            commands=commands,
+            gpus=data.get('gpus', 0),
+            cpus=data.get('cpus', 1),
+            memory=data.get('memory', '4G'),
+            time_limit=data.get('time_limit', '1:00:00'),
+            output_file=output_file,
+            error_file=error_file,
+            partition=data.get('partition')
+        )
+        
+        # 写入脚本
+        with open(script_file, 'w') as f:
+            f.write(script_content)
+        
+        logger.info(f"生成本地 Slurm 脚本: {script_file}")
+        
+        # 提交作业
+        success, result, stdout = submit_slurm_job(script_file)
+        
+        if success:
+            slurm_job_id = result
+            safe_update_task(session, task, 
+                status="running",
+                slurm_job_id=slurm_job_id,
+                started_at=datetime.now()
+            )
+            logger.info(f"本地 Slurm 作业提交成功: task={task_id}, job={slurm_job_id}")
+            
+            return jsonify({
+                "task_id": task_id,
+                "slurm_job_id": slurm_job_id,
+                "message": f"本地 Slurm 作业提交成功: {slurm_job_id}",
+                "target": "local"
+            }), 200
+        else:
+            safe_update_task(session, task, status="failed")
+            logger.error(f"本地 Slurm 提交失败: task={task_id}, error={result}")
+            return jsonify({
+                "error": result,
+                "task_id": task_id,
+                "message": f"本地 Slurm 提交失败: {result}"
+            }), 500
+            
+    except Exception as e:
+        logger.error(f"本地任务提交异常: {task_id} - {e}")
+        safe_update_task(session, task, status="failed")
+        return jsonify({
+            "error": str(e),
+            "task_id": task_id,
+            "message": f"本地任务提交失败: {e}"
+        }), 500
 
 
+# ============ 远程 Slurm 提交 ============
+
+def submit_remote_slurm(session: Session, task: TaskModel, data: dict):
+    """
+    远程 Slurm 作业提交
+    1. 复制文件到临时目录
+    2. rsync 到远程服务器
+    3. 调用远程 API 提交 Slurm 作业
+    """
+    username = data['username']
+    task_id = task.task_id
+    upload_path = data.get('upload', '.')
+    ignore_patterns = data.get('ignore', [])
+    
+    try:
+        # 1. 复制文件到临时目录
+        tmp_path = copy_uploads_to_tmp(username, upload_path, ignore_patterns)
+        if not tmp_path:
+            safe_update_task(session, task, status="failed")
+            return jsonify({
+                "error": "复制文件失败",
+                "task_id": task_id,
+                "message": "无法复制文件到临时目录"
+            }), 500
+        
+        # 2. rsync 到远程服务器
+        if not rsync_to_remote(username, tmp_path):
+            safe_update_task(session, task, status="failed")
+            return jsonify({
+                "error": "rsync 失败",
+                "task_id": task_id,
+                "message": "无法同步文件到远程服务器"
+            }), 500
+        
+        # 3. 调用远程 API 提交 Slurm
+        commands = data.get('commands', [])
+        if isinstance(commands, str):
+            commands = commands.split(' && ')
+        
+        remote_data = {
+            "task_id": task_id,
+            "username": username,
+            "workdir": data.get('workdir', '.'),
+            "commands": commands,
+            "gpus": data.get('gpus', 0),
+            "cpus": data.get('cpus', 1),
+            "memory": data.get('memory', '4G'),
+            "time_limit": data.get('time_limit', '1:00:00'),
+            "partition": data.get('partition')
+        }
+        
+        resp = requests.post(
+            f"{REMOTE_SERVER_URL}/api/submit",
+            json=remote_data,
+            timeout=30
+        )
+        
+        if resp.status_code == 200:
+            result = resp.json()
+            slurm_job_id = result.get('slurm_job_id')
+            
+            safe_update_task(session, task,
+                status="running",
+                slurm_job_id=slurm_job_id,
+                started_at=datetime.now()
+            )
+            
+            logger.info(f"远程 Slurm 作业提交成功: task={task_id}, job={slurm_job_id}")
+            
+            return jsonify({
+                "task_id": task_id,
+                "slurm_job_id": slurm_job_id,
+                "message": f"远程 Slurm 作业提交成功: {slurm_job_id}",
+                "target": "remote"
+            }), 200
+        else:
+            error_msg = resp.json().get('message', '远程提交失败')
+            safe_update_task(session, task, status="failed")
+            logger.error(f"远程 Slurm 提交失败: task={task_id}, error={error_msg}")
+            return jsonify({
+                "error": error_msg,
+                "task_id": task_id,
+                "message": f"远程 Slurm 提交失败: {error_msg}"
+            }), 500
+            
+    except requests.exceptions.RequestException as e:
+        logger.error(f"远程服务器连接失败: {e}")
+        safe_update_task(session, task, status="failed")
+        return jsonify({
+            "error": str(e),
+            "task_id": task_id,
+            "message": f"无法连接远程服务器: {e}"
+        }), 500
+    except Exception as e:
+        logger.error(f"远程任务提交异常: {task_id} - {e}")
+        safe_update_task(session, task, status="failed")
+        return jsonify({
+            "error": str(e),
+            "task_id": task_id,
+            "message": f"远程任务提交失败: {e}"
+        }), 500
+
+
+# ============ 状态轮询 ============
+
+def poll_task_status():
+    """后台轮询任务状态"""
+    logger.info("启动任务状态轮询线程")
+    
+    while not polling_stop_event.is_set():
+        try:
+            session = get_local_session()
+            
+            # 查询运行中的任务
+            running_tasks = session.query(TaskModel).filter(
+                TaskModel.status.in_(['running', 'pending'])
+            ).all()
+            
+            for task in running_tasks:
+                if not task.slurm_job_id:
+                    continue
+                
+                try:
+                    if task.target == 'local':
+                        # 本地 Slurm 状态查询
+                        job_info = get_slurm_job_status(task.slurm_job_id)
+                        if job_info:
+                            new_status = map_slurm_state(job_info.state)
+                            update_task_from_slurm(session, task, job_info, new_status)
+                    
+                    elif task.target == 'remote':
+                        # 远程 Slurm 状态查询
+                        try:
+                            resp = requests.get(
+                                f"{REMOTE_SERVER_URL}/api/status/{task.slurm_job_id}",
+                                timeout=10
+                            )
+                            if resp.status_code == 200:
+                                data = resp.json()
+                                new_status = data.get('status', task.status)
+                                
+                                if new_status != task.status:
+                                    task.status = new_status
+                                    if new_status in ['completed', 'failed', 'canceled']:
+                                        task.completed_at = datetime.now()
+                                        task.exit_code = data.get('exit_code')
+                                    task.updated_at = datetime.now()
+                                    session.commit()
+                                    logger.info(f"任务状态更新: {task.task_id} -> {new_status}")
+                        except requests.exceptions.RequestException as e:
+                            logger.warning(f"查询远程任务状态失败: {task.task_id} - {e}")
+                
+                except Exception as e:
+                    logger.error(f"轮询任务 {task.task_id} 失败: {e}")
+            
+            session.close()
+            
+        except Exception as e:
+            logger.error(f"轮询循环异常: {e}")
+        
+        # 等待下一次轮询
+        polling_stop_event.wait(POLL_INTERVAL)
+    
+    logger.info("任务状态轮询线程已停止")
+
+
+def update_task_from_slurm(session: Session, task: TaskModel, job_info, new_status: str):
+    """根据 Slurm 作业信息更新任务状态"""
+    if new_status != task.status:
+        task.status = new_status
+        
+        if new_status in ['completed', 'failed', 'canceled']:
+            task.completed_at = datetime.now()
+            task.exit_code = job_info.exit_code
+        
+        task.updated_at = datetime.now()
+        session.commit()
+        logger.info(f"任务状态更新: {task.task_id} -> {new_status}")
+
+
+def start_polling_thread():
+    """启动轮询线程"""
+    global polling_thread
+    if polling_thread is None or not polling_thread.is_alive():
+        polling_stop_event.clear()
+        polling_thread = threading.Thread(target=poll_task_status, daemon=True)
+        polling_thread.start()
+
+
+def stop_polling_thread():
+    """停止轮询线程"""
+    polling_stop_event.set()
+    if polling_thread:
+        polling_thread.join(timeout=5)
 # ============ API 路由 ============
 
 @app.route('/api/submit', methods=['POST'])
@@ -102,32 +535,33 @@ def submit_task():
     请求体:
     {
         "username": str,
-        "pyproject_toml": str,
-        "uv_lock": str,
-        "extra_wheels": list[str],
-        "upload": str,
-        "ignore": list[str],
-        "workdir": str,
-        "commands": list[str],
-        "logs": list[str],
-        "results": list[str],
+        "target": str,           # "local" 或 "remote"
+        "upload": str,           # 上传目录路径
+        "ignore": list[str],     # 忽略的文件列表
+        "workdir": str,          # 工作目录
+        "commands": list[str],   # 执行命令列表
+        "logs": list[str],       # 日志路径列表
+        "results": list[str],    # 结果路径列表
         "gpus": int,
         "cpus": int,
         "memory": str,
-        "time_limit": str
+        "time_limit": str,
+        "partition": str (可选)
     }
     
     返回:
     {
         "task_id": str,
-        "message": str
+        "slurm_job_id": str,
+        "message": str,
+        "target": str
     }
     """
     try:
         data = request.get_json()
         
         # 验证必要字段
-        required_fields = ['username', 'upload', 'commands']
+        required_fields = ['username', 'commands']
         for field in required_fields:
             if field not in data:
                 return jsonify({
@@ -136,53 +570,29 @@ def submit_task():
                 }), 400
         
         username = data['username']
-        upload_path = data['upload']
-        ignore_patterns = data.get('ignore', [])
         target = data.get('target', 'local')
-        workdir = data.get('workdir', '.')
-        logs_list = data.get('logs', []) or []
-        results_list = data.get('results', []) or []
-        
-        # 创建上传压缩包
-        try:
-            archive_path, project_hash = create_upload_archive(upload_path, ignore_patterns)
-        except FileNotFoundError as e:
-            return jsonify({
-                "error": str(e),
-                "message": str(e)
-            }), 400
-        
-        # 计算环境哈希（基于 pyproject.toml 和 uv.lock）
-        env_content = f"{data.get('pyproject_toml', '')}:{data.get('uv_lock', '')}"
-        env_hash = hashlib.sha256(env_content.encode()).hexdigest()[:16]
-        
-        # 生成任务 ID
-        task_id = TaskModel.generate_id()
         
         # 合并命令
         commands = data.get('commands', [])
         command_str = ' && '.join(commands) if isinstance(commands, list) else commands
         
-        # 创建任务记录
+        # 创建数据库会话和任务记录
         session = get_local_session()
         try:
             task = TaskModel(
-                task_id=task_id,
                 username=username,
-                name=data.get('name', f"task_{task_id}"),
                 status="pending",
                 target=target,
-                command=command_str,
-                workdir=workdir,
-                logs_path=json.dumps(logs_list, ensure_ascii=False),
-                results_path=json.dumps(results_list, ensure_ascii=False),
-                archive_path=archive_path,
-                gpus=data.get('gpus', 1),
-                cpus=data.get('cpus', 4),
-                memory=data.get('memory', '8G'),
+                upload=data.get('upload', '.'),
+                ignore=json.dumps(data.get('ignore', []), ensure_ascii=False),
+                commands=command_str,
+                workdir=data.get('workdir', '.'),
+                logs_path=json.dumps(data.get('logs', []), ensure_ascii=False),
+                results_path=json.dumps(data.get('results', []), ensure_ascii=False),
+                gpus=data.get('gpus', 0),
+                cpus=data.get('cpus', 1),
+                memory=data.get('memory', '4G'),
                 time_limit=data.get('time_limit', '1:00:00'),
-                project_hash=project_hash,
-                env_hash=env_hash,
             )
             session.add(task)
             
@@ -193,53 +603,38 @@ def submit_task():
             
             # 记录消息日志
             msg_log = MessageLogModel(
-                msg_id=generate_msg_id(),
                 msg_type="task_submit",
                 direction="outgoing",
                 payload=json.dumps({
-                    "task_id": task_id,
+                    "task_id": task.task_id,
                     "username": username,
-                    "archive_path": archive_path,
-                    "env_hash": env_hash,
-                    "pyproject_toml": data.get('pyproject_toml'),
-                    "uv_lock": data.get('uv_lock'),
-                    "extra_wheels": data.get('extra_wheels', []),
-                    "workdir": data.get('workdir', '.'),
-                    "commands": commands,
-                    "logs": data.get('logs', []),
-                    "results": data.get('results', []),
-                    "gpus": data.get('gpus', 1),
-                    "cpus": data.get('cpus', 4),
-                    "memory": data.get('memory', '8G'),
-                    "time_limit": data.get('time_limit', '1:00:00'),
                     "target": target,
-                    "workdir": workdir,
-                    "logs": logs_list,
-                    "results": results_list
+                    "commands": commands
                 }),
                 created_at=datetime.now()
             )
             session.add(msg_log)
-            
             session.commit()
             
-            logger.info(f"任务已提交: {task_id} (用户: {username})")
+            logger.info(f"{username} - 任务已创建: {task.task_id}, target={target}")
             
-            # TODO: 发送任务到远程服务器
-            # 这里需要实现与 remote_server 的通信逻辑
-            
-            return jsonify({
-                "task_id": task_id,
-                "message": f"任务 {task_id} 已成功提交",
-                "target": target
-            }), 200
+            # 根据目标提交任务
+            if target == "local":
+                return submit_local_slurm(session, task, data)
+            elif target == "remote":
+                return submit_remote_slurm(session, task, data)
+            else:
+                return jsonify({
+                    "error": f"未知目标: {target}",
+                    "message": f"目标类型必须是 'local' 或 'remote'"
+                }), 400
             
         except Exception as e:
             session.rollback()
-            logger.error(f"提交任务失败: {e}")
+            logger.error(f"创建任务失败: {e}")
             return jsonify({
                 "error": str(e),
-                "message": f"提交任务失败: {e}"
+                "message": f"创建任务失败: {e}"
             }), 500
         finally:
             session.close()
@@ -313,7 +708,6 @@ def list_tasks():
     参数:
         username: 用户名 (query param)
         status: 状态过滤 (query param, 可选)
-        limit: 数量限制 (query param, 可选, 默认50)
     
     返回:
     {
@@ -330,7 +724,6 @@ def list_tasks():
     """
     username = request.args.get('username')
     status = request.args.get('status')
-    limit = request.args.get('limit', 50, type=int)
     
     if not username:
         return jsonify({
@@ -345,7 +738,7 @@ def list_tasks():
         if status:
             query = query.filter_by(status=status)
         
-        tasks = query.order_by(TaskModel.created_at.desc()).limit(limit).all()
+        tasks = query.order_by(TaskModel.created_at.desc()).all()
         
         return jsonify({
             "tasks": [task.to_dict() for task in tasks]
@@ -361,17 +754,18 @@ def list_tasks():
         session.close()
 
 
-@app.route('/api/logs/<task_id>', methods=['GET'])
-def get_task_logs(task_id: str):
+@app.route('/api/fetch/<task_id>', methods=['GET'])
+def fetch_task_results(task_id: str):
     """
-    获取任务日志
+    获取任务结果文件
     
     参数:
         task_id: 任务ID
         username: 用户名 (query param)
     
     返回:
-        日志文件压缩包 (zip)
+        - 本地任务: 直接返回 ZIP 文件
+        - 远程任务: 从远程下载后返回
     """
     username = request.args.get('username')
     
@@ -389,41 +783,105 @@ def get_task_logs(task_id: str):
         if username and task.username != username:
             return jsonify({
                 "error": "无权限",
-                "message": "您没有权限访问此任务的日志"
+                "message": "您没有权限查看此任务"
             }), 403
         
-        # TODO: 从远程服务器获取日志文件
-        # 目前返回一个临时的日志压缩包
+        # 解析要获取的路径
+        logs_paths = json.loads(task.logs_path or '[]')
+        results_paths = json.loads(task.results_path or '[]')
+        fetch_paths = logs_paths + results_paths
         
-        # 创建临时日志文件
-        temp_dir = Path(tempfile.gettempdir()) / "ailabber_logs"
-        temp_dir.mkdir(parents=True, exist_ok=True)
-        
-        log_zip_path = temp_dir / f"{task_id}_logs.zip"
-        
-        with zipfile.ZipFile(log_zip_path, 'w') as zf:
-            # 添加日志内容
-            log_content = task.logs or f"任务 {task_id} 的日志\n状态: {task.status}\n"
-            zf.writestr(f"{task_id}_stdout.log", log_content)
+        if task.target == 'local':
+            # 本地任务 - 直接打包
+            upload_path = Path(task.upload) if task.upload else Path('.')
+            workdir = task.workdir or '.'
             
-            # 添加任务信息
-            task_info = json.dumps(task.to_dict(), indent=2, ensure_ascii=False)
-            zf.writestr(f"{task_id}_info.json", task_info)
+            if workdir.startswith('/'):
+                work_path = Path(workdir)
+            else:
+                work_path = upload_path / workdir if upload_path.exists() else Path(workdir)
+            work_path = work_path.resolve()
+            
+            # 创建 ZIP
+            temp_dir = tempfile.mkdtemp()
+            zip_path = Path(temp_dir) / f"{task_id}_results.zip"
+            
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                # Slurm 日志
+                slurm_dir = work_path / ".slurm"
+                for suffix in ['.out', '.err', '.sh']:
+                    log_file = slurm_dir / f"{task_id}{suffix}"
+                    if log_file.exists():
+                        zf.write(log_file, f"slurm/{task_id}{suffix}")
+                
+                # 用户指定的路径
+                for rel_path in fetch_paths:
+                    full_path = work_path / rel_path
+                    if full_path.exists():
+                        if full_path.is_file():
+                            zf.write(full_path, rel_path)
+                        elif full_path.is_dir():
+                            for fp in full_path.rglob('*'):
+                                if fp.is_file():
+                                    arc_name = str(fp.relative_to(work_path))
+                                    zf.write(fp, arc_name)
+            
+            return send_file(
+                zip_path,
+                mimetype='application/zip',
+                as_attachment=True,
+                download_name=f"{task_id}_results.zip"
+            )
         
-        logger.info(f"下载任务日志: {task_id} (用户: {username})")
-        
-        return send_file(
-            log_zip_path,
-            as_attachment=True,
-            download_name=f"{task_id}_logs.zip",
-            mimetype='application/zip'
-        )
+        elif task.target == 'remote':
+            # 远程任务 - 调用远程 API
+            try:
+                import urllib.parse
+                paths_param = urllib.parse.quote(json.dumps(fetch_paths))
+                
+                resp = requests.get(
+                    f"{REMOTE_SERVER_URL}/api/fetch/{task_id}",
+                    params={
+                        "username": task.username,
+                        "workdir": task.workdir,
+                        "paths": json.dumps(fetch_paths)
+                    },
+                    timeout=300,
+                    stream=True
+                )
+                
+                if resp.status_code == 200:
+                    # 保存到临时文件
+                    temp_dir = tempfile.mkdtemp()
+                    zip_path = Path(temp_dir) / f"{task_id}_results.zip"
+                    
+                    with open(zip_path, 'wb') as f:
+                        for chunk in resp.iter_content(chunk_size=8192):
+                            f.write(chunk)
+                    
+                    return send_file(
+                        zip_path,
+                        mimetype='application/zip',
+                        as_attachment=True,
+                        download_name=f"{task_id}_results.zip"
+                    )
+                else:
+                    return jsonify({
+                        "error": "获取远程结果失败",
+                        "message": resp.json().get('message', '未知错误')
+                    }), resp.status_code
+                    
+            except requests.exceptions.RequestException as e:
+                return jsonify({
+                    "error": str(e),
+                    "message": f"无法连接远程服务器: {e}"
+                }), 500
         
     except Exception as e:
-        logger.error(f"获取任务日志失败: {e}")
+        logger.error(f"获取任务结果失败: {e}")
         return jsonify({
             "error": str(e),
-            "message": f"获取任务日志失败: {e}"
+            "message": f"获取任务结果失败: {e}"
         }), 500
     finally:
         session.close()
@@ -441,7 +899,7 @@ def cancel_task(task_id: str):
     返回:
     {
         "message": str,
-        "status": str  # "canceled" 或 "terminated"
+        "status": str
     }
     """
     username = request.args.get('username')
@@ -463,54 +921,56 @@ def cancel_task(task_id: str):
                 "message": "您没有权限取消此任务"
             }), 403
         
-        # 检查任务状态
-        old_status = task.status
-        
-        if task.status in ['completed', 'failed', 'canceled', 'terminated']:
+        # 已完成的任务无法取消
+        if task.status in ['completed', 'failed', 'canceled']:
             return jsonify({
-                "message": f"任务已经是 {task.status} 状态，无法取消",
+                "message": f"任务已是 {task.status} 状态",
                 "status": task.status
             }), 400
         
-        # 根据任务状态决定操作
-        if task.status == 'pending':
-            # 未开始的任务直接取消
-            task.status = 'canceled'
-            new_status = 'canceled'
-            message = f"任务 {task_id} 已取消"
-        else:
-            # 已开始的任务需要终止
-            task.status = 'terminated'
-            new_status = 'terminated'
-            message = f"任务 {task_id} 已终止"
-            
-            # TODO: 发送取消请求到远程服务器
-            # 需要实现与 remote_server 的通信来真正终止任务
+        old_status = task.status
         
+        # 如果有 Slurm 作业，需要取消
+        if task.slurm_job_id:
+            if task.target == 'local':
+                success, message = cancel_slurm_job(task.slurm_job_id)
+                if not success:
+                    logger.warning(f"取消本地 Slurm 作业失败: {message}")
+            elif task.target == 'remote':
+                try:
+                    resp = requests.post(
+                        f"{REMOTE_SERVER_URL}/api/cancel/{task.slurm_job_id}",
+                        timeout=10
+                    )
+                    if resp.status_code != 200:
+                        logger.warning(f"取消远程 Slurm 作业失败: {resp.json()}")
+                except Exception as e:
+                    logger.warning(f"取消远程作业异常: {e}")
+        
+        # 更新状态
+        task.status = 'canceled'
+        task.completed_at = datetime.now()
         task.updated_at = datetime.now()
         
-        # 记录消息日志
+        # 记录日志
         msg_log = MessageLogModel(
-            msg_id=generate_msg_id(),
             msg_type="task_cancel",
             direction="outgoing",
             payload=json.dumps({
                 "task_id": task_id,
-                "username": username,
                 "old_status": old_status,
-                "new_status": new_status
+                "new_status": "canceled"
             }),
             created_at=datetime.now()
         )
         session.add(msg_log)
-        
         session.commit()
         
-        logger.info(f"任务状态变更: {task_id} {old_status} -> {new_status}")
+        logger.info(f"任务已取消: {task_id}")
         
         return jsonify({
-            "message": message,
-            "status": new_status
+            "message": f"任务 {task_id} 已取消",
+            "status": "canceled"
         }), 200
         
     except Exception as e:
@@ -524,29 +984,120 @@ def cancel_task(task_id: str):
         session.close()
 
 
+@app.route('/api/logs/<task_id>', methods=['GET'])
+def get_task_logs(task_id: str):
+    """
+    获取任务执行日志（不下载文件）
+    
+    参数:
+        task_id: 任务ID
+        username: 用户名 (query param)
+    
+    返回:
+    {
+        "task_id": str,
+        "stdout": str,
+        "stderr": str
+    }
+    """
+    username = request.args.get('username')
+    
+    session = get_local_session()
+    try:
+        task = session.query(TaskModel).filter_by(task_id=task_id).first()
+        
+        if not task:
+            return jsonify({
+                "error": "任务不存在",
+                "message": f"任务 {task_id} 不存在"
+            }), 404
+        
+        if username and task.username != username:
+            return jsonify({
+                "error": "无权限",
+                "message": "您没有权限查看此任务"
+            }), 403
+        
+        if task.target == 'local':
+            # 本地任务 - 直接读取日志
+            upload_path = Path(task.upload) if task.upload else Path('.')
+            workdir = task.workdir or '.'
+            
+            if workdir.startswith('/'):
+                work_path = Path(workdir)
+            else:
+                work_path = upload_path / workdir if upload_path.exists() else Path(workdir)
+            work_path = work_path.resolve()
+            
+            slurm_dir = work_path / ".slurm"
+            stdout = read_slurm_output(str(slurm_dir / f"{task_id}.out"))
+            stderr = read_slurm_output(str(slurm_dir / f"{task_id}.err"))
+            
+            return jsonify({
+                "task_id": task_id,
+                "stdout": stdout,
+                "stderr": stderr
+            }), 200
+            
+        elif task.target == 'remote':
+            # 远程任务 - 调用远程 API
+            try:
+                resp = requests.get(
+                    f"{REMOTE_SERVER_URL}/api/logs/{task_id}",
+                    params={
+                        "username": task.username,
+                        "workdir": task.workdir
+                    },
+                    timeout=30
+                )
+                
+                if resp.status_code == 200:
+                    return jsonify(resp.json()), 200
+                else:
+                    return jsonify(resp.json()), resp.status_code
+                    
+            except requests.exceptions.RequestException as e:
+                return jsonify({
+                    "error": str(e),
+                    "message": f"无法连接远程服务器: {e}"
+                }), 500
+        
+    except Exception as e:
+        logger.error(f"获取任务日志失败: {e}")
+        return jsonify({
+            "error": str(e),
+            "message": f"获取任务日志失败: {e}"
+        }), 500
+    finally:
+        session.close()
+
+
 # ============ 健康检查 ============
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    """健康检查端点"""
+    """健康检查"""
     return jsonify({
         "status": "healthy",
         "service": "local_proxy",
-        "timestamp": datetime.now().isoformat()
+        "timestamp": datetime.now().isoformat(),
+        "polling_active": polling_thread is not None and polling_thread.is_alive()
     }), 200
 
 
 @app.route('/', methods=['GET'])
 def index():
-    """根路径"""
+    """根路径 - API 文档"""
     return jsonify({
         "service": "ailabber Local Proxy",
-        "version": "1.0.0",
+        "version": "2.0.0",
+        "description": "本地代理服务器 - 支持本地/远程 Slurm 调度",
         "endpoints": [
             "POST /api/submit - 提交任务",
             "GET /api/status/<task_id> - 获取任务状态",
             "GET /api/tasks - 列出用户任务",
-            "GET /api/logs/<task_id> - 下载任务日志",
+            "GET /api/logs/<task_id> - 获取任务日志",
+            "GET /api/fetch/<task_id> - 下载任务结果",
             "POST /api/cancel/<task_id> - 取消任务",
             "GET /health - 健康检查"
         ]
@@ -557,13 +1108,20 @@ def index():
 
 def main():
     """启动服务器"""
+    # 启动轮询线程
+    start_polling_thread()
+    
     logger.info(f"Local Proxy 服务器启动于端口 {LOCAL_PROXY_PORT}")
-    app.run(
-        host='127.0.0.1',
-        port=LOCAL_PROXY_PORT,
-        debug=False,
-        threaded=True
-    )
+    
+    try:
+        app.run(
+            host='127.0.0.1',
+            port=LOCAL_PROXY_PORT,
+            debug=False,
+            threaded=True
+        )
+    finally:
+        stop_polling_thread()
 
 
 if __name__ == '__main__':

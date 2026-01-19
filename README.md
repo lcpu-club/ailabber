@@ -1,184 +1,222 @@
-# ailabber
+# ailabber - 分布式 Slurm 任务调度系统
 
-AI Lab 分布式任务提交系统 - 为 AI 课程设计的 GPU 集群任务管理工具。
+ailabber 是一个轻量级的分布式任务调度系统，支持本地和远程 Slurm 集群任务提交。
 
-## 系统架构
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         LOCAL (5090 Node)                        │
-│                                                                  │
-│   ┌─────────┐         ┌─────────────────────────────┐           │
-│   │   CLI   │ ──────▶ │     Local Proxy Server      │           │
-│   │(student)│  HTTP   │   - 用户会话管理             │           │
-│   └─────────┘         │   - 文件缓存与同步           │           │
-│                       │   - 任务状态轮询             │           │
-│                       └──────────────┬──────────────┘           │
-└──────────────────────────────────────┼──────────────────────────┘
-                                       │
-                              ┌────────▼────────┐
-                              │  rsync/frp      │
-                              └────────┬────────┘
-                                       │
-┌──────────────────────────────────────┼──────────────────────────┐
-│                           REMOTE CLUSTER                        │
-│                      ┌───────────────▼───────────────┐          │
-│                      │       Remote Server           │          │
-│                      │   - 任务队列管理                │          │
-│                      │   - 环境复现                   │          │
-│                      │   - Slurm 任务提交             │          │
-│                      └───────────────┬───────────────┘          │
-│                                      │                          │
-│                      ┌───────────────▼───────────────┐          │
-│                      │        Slurm Cluster          │          │
-│                      └───────────────────────────────┘          │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-## 项目结构
+## 架构概述
 
 ```
-ailabber/
-├── client/
-│   └── cli.py              # 命令行客户端
-├── server/
-│   ├── local_proxy.py      # 本地代理服务器 (Flask)
-│   └── remote_server.py    # 远程服务器
-├── shared/
-│   ├── config.py           # 配置常量
-│   ├── database.py         # 数据库 ORM 模型
-│   └── logger.py           # 日志配置
-├── utils/
-│   └── db_init.py          # 数据库初始化工具
-├── task_config.toml        # 任务配置示例
-├── pyproject.toml          # 项目依赖
-└── README.md
+┌─────────────┐      ┌─────────────────┐      ┌─────────────────┐
+│   CLI       │ ───► │  Local Proxy    │ ───► │  Remote Server  │
+│  (客户端)    │      │  (本地代理)      │      │  (远程服务器)    │
+└─────────────┘      └─────────────────┘      └─────────────────┘
+                            │                         │
+                            ▼                         ▼
+                     ┌─────────────┐          ┌─────────────┐
+                     │ Local Slurm │          │ Remote Slurm│
+                     │  (本地集群)  │          │  (远程集群)  │
+                     └─────────────┘          └─────────────┘
 ```
+
+### 组件说明
+
+1. **CLI (client/cli.py)**: 命令行客户端，用户交互入口
+2. **Local Proxy (server/local_proxy.py)**: 本地代理服务器
+   - 接收 CLI 请求
+   - 本地任务：直接提交到本地 Slurm
+   - 远程任务：rsync 文件后调用远程 API
+   - 后台轮询任务状态
+3. **Remote Server (server/remote_server.py)**: 远程服务器（极简设计）
+   - 接收任务提交请求 → 生成 Slurm 脚本并提交
+   - 接受状态轮询 → 返回 Slurm 作业状态
+   - 返回日志和结果文件
 
 ## 安装
 
 ```bash
-# 克隆项目
-git clone <repo-url>
-cd ailabber
+# 安装依赖
+pip install flask sqlalchemy shortuuid requests
 
-# 使用 uv 安装依赖
+# 或使用 uv
 uv sync
 ```
 
 ## 快速开始
 
-### 1. 启动本地代理服务器
+### 1. 启动本地代理
 
 ```bash
 python -m server.local_proxy
+# 或
+ailabber-proxy
 ```
 
-服务器默认运行在 `http://127.0.0.1:8080`
+### 2. (可选) 启动远程服务器
 
-### 2. 使用 CLI 提交任务
+在远程 Slurm 集群上运行：
 
 ```bash
-# 查看当前用户
-python -m client.cli whoami
-
-# 提交任务（使用当前目录的 task_config.toml）
-python -m client.cli submit
-
-# 提交任务（指定配置文件）
-python -m client.cli submit ./my_task_config.toml
-
-# 查看任务状态
-python -m client.cli status <task_id>
-
-# 列出所有任务
-python -m client.cli list
-
-# 下载任务日志和结果
-python -m client.cli fetch <task_id>
-
-# 取消任务
-python -m client.cli cancel <task_id>
-
-# 显示帮助
-python -m client.cli help
+python -m server.remote_server
+# 或
+ailabber-remote
 ```
 
-## 任务配置
+### 3. 提交任务
 
-创建 `task_config.toml` 文件来配置任务：
+```bash
+# 提交到本地 Slurm
+ailabber submit local ./task_config.toml
+
+# 提交到远程 Slurm
+ailabber submit remote ./task_config.toml
+```
+
+## 配置文件
+
+### task_config.toml
 
 ```toml
 [resources]
-gpus = 1                      # GPU 数量
-cpus = 4                      # CPU 核心数
-memory = "32G"                # 内存限制
-time_limit = "4:00:00"        # 运行时间限制
+gpus = 1
+cpus = 4
+memory = "32G"
+time_limit = "4:00:00"    # Slurm 时间限制
 
 [environment]
-pyproject_toml = "./pyproject.toml"   # 项目配置
-uv_lock = "./uv.lock"                 # 锁文件
-extra_wheels = [                       # 额外的 wheel 包
-    "./dist/my_custom_op-0.1.0-cp310-linux_x86_64.whl"
-]
+pyproject_toml = "./pyproject.toml"
+uv_lock = "./uv.lock"
+extra_wheels = []
 
-[files]
-upload = "."                  # 上传目录
-ignore = [                    # 忽略的文件/目录
-    "./__pycache__/"
+[submit]
+upload = "."              # 要同步的目录
+ignore = [                # 忽略的文件/目录
+    "./__pycache__/",
+    "./.git/",
+    "./.venv/"
 ]
-workdir = "."                 # 工作目录
 
 [run]
-commands = [                  # 运行命令
+workdir = "."             # 工作目录
+commands = [              # 执行命令
     "python train.py --config configs/resnet50.yaml"
 ]
-logs = ["./logs"]             # 日志目录
-results = ["./output"]        # 结果目录
+
+[fetch]
+logs = ["./logs"]         # 日志目录
+results = ["./output"]    # 结果目录
+```
+
+### shared/config.py 配置
+
+```python
+# 服务端口
+LOCAL_PROXY_PORT = 8080
+REMOTE_SERVER_PORT = 8080
+
+# 远程服务器 SSH 配置
+REMOTE_SSH_HOST = "your-server.com"
+REMOTE_SSH_PORT = 22
+REMOTE_SSH_USER = "username"
+REMOTE_BASE_DIR = "/home/username"
+
+# 轮询间隔
+POLL_INTERVAL = 5  # 秒
+```
+
+## CLI 命令
+
+```bash
+ailabber help                    # 显示帮助
+ailabber whoami                  # 查看当前用户
+ailabber submit [local|remote] [config]  # 提交任务
+ailabber status <task_id>        # 查看任务状态
+ailabber list [status]           # 列出任务
+ailabber fetch <task_id> [dir]   # 下载结果
+ailabber cancel <task_id>        # 取消任务
 ```
 
 ## API 端点
 
-| 端点 | 方法 | 描述 |
+### Local Proxy (localhost:8080)
+
+| 方法 | 端点 | 说明 |
 |------|------|------|
-| `/api/submit` | POST | 提交新任务 |
-| `/api/status/<task_id>` | GET | 获取任务状态 |
-| `/api/tasks` | GET | 列出用户任务 |
-| `/api/logs/<task_id>` | GET | 下载任务日志 |
-| `/api/cancel/<task_id>` | POST | 取消/终止任务 |
-| `/health` | GET | 健康检查 |
+| POST | /api/submit | 提交任务 |
+| GET | /api/status/<task_id> | 获取任务状态 |
+| GET | /api/tasks | 列出用户任务 |
+| GET | /api/logs/<task_id> | 获取任务日志 |
+| GET | /api/fetch/<task_id> | 下载任务结果 |
+| POST | /api/cancel/<task_id> | 取消任务 |
+| GET | /health | 健康检查 |
+
+### Remote Server (远程:8080)
+
+| 方法 | 端点 | 说明 |
+|------|------|------|
+| POST | /api/submit | 提交 Slurm 作业 |
+| GET | /api/status/<slurm_job_id> | 查询作业状态 |
+| GET | /api/logs/<task_id> | 获取日志 |
+| GET | /api/fetch/<task_id> | 下载结果 |
+| POST | /api/cancel/<slurm_job_id> | 取消作业 |
+| GET | /health | 健康检查 |
 
 ## 任务状态
 
-| 状态 | 描述 |
+| 状态 | 说明 |
 |------|------|
-| `pending` | 等待执行 |
-| `running` | 正在运行 |
-| `completed` | 执行完成 |
-| `failed` | 执行失败 |
-| `canceled` | 已取消（未开始） |
-| `terminated` | 已终止（运行中取消） |
+| pending | 等待中 |
+| running | 运行中 |
+| completed | 已完成 |
+| failed | 失败 |
+| canceled | 已取消 |
 
-## 配置说明
+## 目录结构
 
-配置文件位于 `shared/config.py`：
-
-```python
-# 服务端口
-LOCAL_PROXY_PORT = 8080       # 本地代理端口
-REMOTE_SERVER_PORT = 8080     # 远程服务器端口
-
-# 数据目录
-DATA_DIR = ~/.ailabber        # 数据存储目录
-LOCAL_DB_PATH = ~/.ailabber/local_proxy.db   # 本地数据库
+```
+ailabber/
+├── client/
+│   ├── __init__.py
+│   └── cli.py              # 命令行客户端
+├── server/
+│   ├── __init__.py
+│   ├── local_proxy.py      # 本地代理服务器
+│   └── remote_server.py    # 远程服务器
+├── shared/
+│   ├── __init__.py
+│   ├── config.py           # 配置常量
+│   ├── database.py         # 数据库模型
+│   ├── logger.py           # 日志工具
+│   └── slurm.py            # Slurm 工具函数
+├── utils/
+│   ├── __init__.py
+│   └── db_init.py          # 数据库初始化
+├── pyproject.toml
+├── task_config.toml        # 示例任务配置
+└── README.md
 ```
 
-## 依赖
+## 工作流程
 
-- Python >= 3.10
-- Flask >= 3.1
-- Requests >= 2.32
-- SQLAlchemy >= 2.0
+### 本地任务
+
+1. CLI 发送任务到 Local Proxy
+2. Local Proxy 生成 Slurm 脚本
+3. 提交到本地 Slurm 集群
+4. 后台轮询状态更新
+
+### 远程任务
+
+1. CLI 发送任务到 Local Proxy
+2. Local Proxy rsync 文件到远程服务器
+3. 调用 Remote Server API 提交 Slurm 作业
+4. Remote Server 生成并提交 Slurm 脚本
+5. Local Proxy 轮询远程状态
+
+## 注意事项
+
+1. 确保本地和远程都安装了 Slurm
+2. 远程任务需要配置 SSH 密钥免密登录
+3. 确保 rsync 命令可用
+4. 远程服务器需要开放对应端口或配置 SSH 隧道
 
 ## License
 

@@ -55,10 +55,10 @@ class TaskModel(Base):
     username: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
     target: Mapped[str] = mapped_column(String(16), default="local", index=True)
-    uploads: Mapped[Optional[str]] = mapped_column(Text)
-    ignore: Mapped[Optional[str]] = mapped_column(Text)# TODO:最后全返回为绝对路径
-    commands: Mapped[Optional[str]] = mapped_column(Text)# TODO:最后全返回为绝对路径
-    workdir: Mapped[str] = mapped_column(String(256), default=".")# TODO:最后全返回为绝对路径
+    upload: Mapped[Optional[str]] = mapped_column(Text)  # 上传目录路径
+    ignore: Mapped[Optional[str]] = mapped_column(Text)   # 忽略的文件/目录列表 (JSON)
+    commands: Mapped[Optional[str]] = mapped_column(Text) # 执行命令 (合并后的字符串)
+    workdir: Mapped[str] = mapped_column(String(256), default=".")
     logs_path: Mapped[Optional[str]] = mapped_column(Text)   # JSON 列表字符串
     results_path: Mapped[Optional[str]] = mapped_column(Text)  # JSON 列表字符串
     gpus: Mapped[int] = mapped_column(Integer)
@@ -68,8 +68,7 @@ class TaskModel(Base):
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     exit_code: Mapped[Optional[int]] = mapped_column(Integer)
-    project_hash: Mapped[Optional[str]] = mapped_column(String(64))
-    env_hash: Mapped[Optional[str]] = mapped_column(String(64))
+    logs: Mapped[Optional[str]] = mapped_column(Text)  # TODO:任务执行日志
     slurm_job_id: Mapped[Optional[str]] = mapped_column(String(32))
     
     def to_dict(self) -> dict:
@@ -104,25 +103,6 @@ class MessageLogModel(Base):
     msg_type: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     direction: Mapped[str] = mapped_column(String(16), nullable=False)  # outgoing, incoming
     payload: Mapped[Optional[str]] = mapped_column(Text)
-    processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
-
-
-class CacheManifestModel(Base):
-    """本地缓存清单"""
-    __tablename__ = "cache_manifest"
-    
-    cache_id: Mapped[str] = mapped_column(String(16), primary_key=True, default=generate_uuid)
-    cache_type: Mapped[str] = mapped_column(String(32), index=True)  # env, project, data
-    hash: Mapped[str] = mapped_column(String(64), index=True)
-    path: Mapped[str] = mapped_column(Text)
-
-
-class EnvCacheModel(Base):
-    """远端环境缓存"""
-    __tablename__ = "env_cache"
-    
-    cache_id: Mapped[str] = mapped_column(String(16), primary_key=True, default=generate_uuid)
-    env_hash: Mapped[str] = mapped_column(String(64), index=True)
 
 
 # ============ 数据库引擎管理 ============
@@ -135,10 +115,8 @@ def get_local_engine():
 def init_local_db():
     """初始化 Local Proxy 数据库"""
     engine = get_local_engine()
-    # 只创建 Local 相关的表
     UserModel.__table__.create(engine, checkfirst=True)
     TaskModel.__table__.create(engine, checkfirst=True)
-    CacheManifestModel.__table__.create(engine, checkfirst=True)
     MessageLogModel.__table__.create(engine, checkfirst=True)
     return engine
 
