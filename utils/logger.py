@@ -2,7 +2,7 @@
 import logging
 import sys
 from pathlib import Path
-from shared.config import LOG_LEVEL_CONSOLE, LOG_LEVEL_FILE, DATA_DIR
+from core.config import LOG_LEVEL_CONSOLE, LOG_LEVEL_FILE, DATA_DIR
 
 def get_logger(name: str) -> logging.Logger:
     """获取配置好的 logger"""

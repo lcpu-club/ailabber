@@ -31,10 +31,10 @@ SLURM_STATE_MAP = {
     "COMPLETED": "completed",
     "FAILED": "failed",
     "CANCELLED": "canceled",
-    "TIMEOUT": "failed",
-    "NODE_FAIL": "failed",
-    "PREEMPTED": "failed",
-    "OUT_OF_MEMORY": "failed",
+    "TIMEOUT": "timeout",
+    "NODE_FAIL": "node_fail",
+    "PREEMPTED": "preempted",
+    "OUT_OF_MEMORY": "out_of_memory",
 }
 
 

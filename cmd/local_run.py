@@ -1,9 +1,10 @@
 """local-run command - Run command via Slurm (with logging)"""
 import os
 import requests
+import json
 from pathlib import Path
 
-from shared.config import LOCAL_PROXY_URL
+from core.config import LOCAL_PROXY_URL
 from utils.slurm import generate_slurm_script, submit_slurm_job
 
 current_username = os.environ.get('USER', 'unknown')

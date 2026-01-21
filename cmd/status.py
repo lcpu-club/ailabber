@@ -2,7 +2,7 @@
 import os
 import requests
 
-from shared.config import LOCAL_PROXY_URL
+from core.config import LOCAL_PROXY_URL
 
 current_username = os.environ.get('USER', 'unknown')
 
