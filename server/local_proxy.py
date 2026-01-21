@@ -454,8 +454,8 @@ def poll_task_status():
                     continue
                 
                 try:
-                    if task.target == 'local':
-                        # 本地 Slurm 状态查询
+                    if task.target in ['local', 'local-run']:
+                        # 本地 Slurm 状态查询 (包括 local-run)
                         job_info = get_slurm_job_status(task.slurm_job_id)
                         if job_info:
                             new_status = map_slurm_state(job_info.state)
@@ -645,6 +645,126 @@ def submit_task():
             "error": str(e),
             "message": f"处理请求失败: {e}"
         }), 500
+
+
+@app.route('/api/local-run', methods=['POST'])
+def create_local_run_task():
+    """
+    Create DB record for local-run (does NOT submit Slurm job)
+    CLI will submit Slurm job directly after getting task_id
+    
+    Request:
+    {
+        "username": str,
+        "workdir": str,
+        "commands": [str],
+        "gpus": int,
+        "cpus": int,
+        "memory": str,
+        "time_limit": str
+    }
+    
+    Response:
+    {
+        "task_id": str
+    }
+    """
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({"error": "Invalid JSON data"}), 400
+        
+        username = data.get('username')
+        if not username:
+            return jsonify({"error": "Username is required"}), 400
+        
+        session = get_local_session()
+        try:
+            # Create task record (pending status, no slurm_job_id yet)
+            task = TaskModel(
+                username=username,
+                status="pending",
+                target="local-run",
+                workdir=data.get('workdir', '.'),
+                commands=json.dumps(data.get('commands', [])),
+                gpus=data.get('gpus', 0),
+                cpus=data.get('cpus', 1),
+                memory=data.get('memory', '4G'),
+                time_limit=data.get('time_limit', '1:00:00'),
+                created_at=datetime.now(),
+                updated_at=datetime.now()
+            )
+            session.add(task)
+            
+            # Update user stats
+            user = session.query(UserModel).filter_by(username=username).first()
+            if user:
+                user.total_tasks += 1
+            
+            session.commit()
+            task_id = task.task_id
+            
+            logger.info(f"Created local-run task record: {task_id}")
+            
+            return jsonify({"task_id": task_id}), 200
+            
+        except Exception as e:
+            session.rollback()
+            logger.error(f"Failed to create task: {e}")
+            return jsonify({"error": str(e)}), 500
+        finally:
+            session.close()
+            
+    except Exception as e:
+        logger.error(f"Request processing failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/local-run/<task_id>/slurm', methods=['POST'])
+def update_local_run_slurm(task_id: str):
+    """
+    Update task with Slurm job ID after CLI submits the job
+    
+    Request:
+    {
+        "slurm_job_id": str
+    }
+    """
+    try:
+        data = request.get_json()
+        slurm_job_id = data.get('slurm_job_id')
+        
+        if not slurm_job_id:
+            return jsonify({"error": "slurm_job_id is required"}), 400
+        
+        session = get_local_session()
+        try:
+            task = session.query(TaskModel).filter_by(task_id=task_id).first()
+            
+            if not task:
+                return jsonify({"error": "Task not found"}), 404
+            
+            task.slurm_job_id = slurm_job_id
+            task.status = "running"
+            task.started_at = datetime.now()
+            task.updated_at = datetime.now()
+            session.commit()
+            
+            logger.info(f"Updated task {task_id} with Slurm job {slurm_job_id}")
+            
+            return jsonify({"message": "Updated successfully"}), 200
+            
+        except Exception as e:
+            session.rollback()
+            logger.error(f"Failed to update task: {e}")
+            return jsonify({"error": str(e)}), 500
+        finally:
+            session.close()
+            
+    except Exception as e:
+        logger.error(f"Request processing failed: {e}")
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route('/api/status/<task_id>', methods=['GET'])

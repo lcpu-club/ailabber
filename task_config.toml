@@ -1,26 +1,21 @@
+# >>> NOTE <<<
+# uv.lock pyproject.toml 请放在项目根目录
+# 若有自行编译的wheel，请放在项目文件夹内（不必是根目录），并使用 uv add ./dist/mypackage-1.0.0-py3-none-any.whl 安装该依赖
+# >>> END <<<
+
 [resources]
 gpus = 1
 cpus = 4
 memory = "32G"
-time_limit = "4:00:00"    # Slurm 时间限制
-
-[environment]
-# pyproject.toml、uv.lock文件路径
-pyproject_toml = "./pyproject.toml"
-uv_lock = "./uv.lock"
-# 额外的 wheel 文件（本地路径）
-extra_wheels = [
-    # "./dist/my_custom_op-0.1.0-cp310-linux_x86_64.whl"
-]
+time_limit = "4:00:00"
 
 [submit]
-# 需要同步到远端的数据
+# 要同步到远端的数据（仅 remote 提交需要）
 upload = "."
 # 忽略的文件/目录
 ignore = [
     "./__pycache__/",
     "./.git/",
-    "./ailabber/",
     "./.venv/",
     "./.vscode/"
 ]
@@ -30,15 +25,17 @@ ignore = [
 workdir = "."
 # 运行命令（按顺序执行）
 commands = [
-    "python train.py --config configs/resnet50.yaml"
+    "echo 'Hello from ailabber!'",
+    "python --version",
+    "nvidia-smi"
 ]
 
 [fetch]
-# 日志路径（用于fetch）
+# 日志路径（用于fetch下载）
 logs = [
     "./logs"
 ]
-# 结果路径（用于fetch）
+# 结果路径（用于fetch下载）
 results = [
     "./output"
 ]

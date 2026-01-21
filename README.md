@@ -2,6 +2,12 @@
 
 ailabber 是一个轻量级的分布式任务调度系统，支持本地和远程 Slurm 集群任务提交。
 
+## 核心功能
+
+1. **通过代理提交远程任务**: `ailabber submit remote <config.toml>` - 同步文件到远程 + 提交到远程 Slurm
+2. **通过代理提交本地任务**: `ailabber submit local <config.toml>` - 通过代理提交到本地 Slurm
+3. **直接调用本地 Slurm**: `ailabber run <config.toml>` - 类似 `uv run`，直接封装调用本地 Slurm，不经过代理
+
 ## 架构概述
 
 ```
@@ -9,26 +15,32 @@ ailabber 是一个轻量级的分布式任务调度系统，支持本地和远�
 │   CLI       │ ───► │  Local Proxy    │ ───► │  Remote Server  │
 │  (客户端)    │      │  (本地代理)      │      │  (远程服务器)    │
 └─────────────┘      └─────────────────┘      └─────────────────┘
-                            │                         │
-                            ▼                         ▼
-                     ┌─────────────┐          ┌─────────────┐
-                     │ Local Slurm │          │ Remote Slurm│
-                     │  (本地集群)  │          │  (远程集群)  │
-                     └─────────────┘          └─────────────┘
+       │                     │                         │
+       │ (run命令)            ▼                         ▼
+       └────────────► ┌─────────────┐          ┌─────────────┐
+                      │ Local Slurm │          │ Remote Slurm│
+                      │  (本地集群)  │          │  (远程集群)  │
+                      └─────────────┘          └─────────────┘
 ```
 
 ### 组件说明
 
-1. **CLI (client/cli.py)**: 命令行客户端，用户交互入口
+1. **CLI (client/cli.py)**: 命令行客户端
+   - `submit remote/local`: 通过代理提交任务
+   - `run`: 直接调用本地 Slurm（不经过代理）
+   - `status/list/fetch/cancel`: 任务管理
+
 2. **Local Proxy (server/local_proxy.py)**: 本地代理服务器
    - 接收 CLI 请求
-   - 本地任务：直接提交到本地 Slurm
-   - 远程任务：rsync 文件后调用远程 API
+   - 本地任务：提交到本地 Slurm
+   - 远程任务：rsync 文件 + 调用远程 API
    - 后台轮询任务状态
-3. **Remote Server (server/remote_server.py)**: 远程服务器（极简设计）
-   - 接收任务提交请求 → 生成 Slurm 脚本并提交
-   - 接受状态轮询 → 返回 Slurm 作业状态
-   - 返回日志和结果文件
+   - 维护本地数据库
+
+3. **Remote Server (server/remote_server.py)**: 远程服务器
+   - 接收任务提交 → 生成并提交 Slurm 脚本
+   - 状态查询 → 返回 Slurm 作业状态
+   - 文件下载 → 返回日志和结果
 
 ## 安装
 
@@ -42,52 +54,19 @@ uv sync
 
 ## 快速开始
 
-### 1. 启动本地代理
+### 1. 配置文件
 
-```bash
-python -m server.local_proxy
-# 或
-ailabber-proxy
-```
-
-### 2. (可选) 启动远程服务器
-
-在远程 Slurm 集群上运行：
-
-```bash
-python -m server.remote_server
-# 或
-ailabber-remote
-```
-
-### 3. 提交任务
-
-```bash
-# 提交到本地 Slurm
-ailabber submit local ./task_config.toml
-
-# 提交到远程 Slurm
-ailabber submit remote ./task_config.toml
-```
-
-## 配置文件
-
-### task_config.toml
+创建 `task_config.toml`:
 
 ```toml
 [resources]
 gpus = 1
 cpus = 4
 memory = "32G"
-time_limit = "4:00:00"    # Slurm 时间限制
-
-[environment]
-pyproject_toml = "./pyproject.toml"
-uv_lock = "./uv.lock"
-extra_wheels = []
+time_limit = "4:00:00"
 
 [submit]
-upload = "."              # 要同步的目录
+upload = "."              # 要同步的目录（仅remote需要）
 ignore = [                # 忽略的文件/目录
     "./__pycache__/",
     "./.git/",
@@ -97,90 +76,107 @@ ignore = [                # 忽略的文件/目录
 [run]
 workdir = "."             # 工作目录
 commands = [              # 执行命令
-    "python train.py --config configs/resnet50.yaml"
+    "python train.py --config config.yaml"
 ]
 
 [fetch]
-logs = ["./logs"]         # 日志目录
-results = ["./output"]    # 结果目录
+logs = ["./logs"]         # 日志路径
+results = ["./output"]    # 结果路径
 ```
 
-### shared/config.py 配置
+### 2. 使用方式
+
+#### 方式一：直接运行（不经过代理）
+
+```bash
+# 直接调用本地 Slurm，类似 uv run
+ailabber run task_config.toml
+```
+
+#### 方式二：通过代理提交到本地
+
+```bash
+# 启动本地代理（另一个终端）
+python -m server.local_proxy
+
+# 提交任务
+ailabber submit local task_config.toml
+
+# 查看状态
+ailabber status <task_id>
+
+# 下载结果
+ailabber fetch <task_id>
+```
+
+#### 方式三：提交到远程集群
+
+```bash
+# 1. 在远程机器启动服务
+ssh remote-server
+python -m server.remote_server
+
+# 2. 配置 shared/config.py 中的远程服务器地址
+
+# 3. 启动本地代理
+python -m server.local_proxy
+
+# 4. 提交任务
+ailabber submit remote task_config.toml
+
+# 5. 查看状态和下载结果
+ailabber status <task_id>
+ailabber fetch <task_id>
+```
+
+## 配置说明
+
+编辑 `shared/config.py`:
 
 ```python
-# 服务端口
-LOCAL_PROXY_PORT = 8080
-REMOTE_SERVER_PORT = 8080
-
-# 远程服务器 SSH 配置
-REMOTE_SSH_HOST = "your-server.com"
-REMOTE_SSH_PORT = 22
-REMOTE_SSH_USER = "username"
-REMOTE_BASE_DIR = "/home/username"
-
-# 轮询间隔
-POLL_INTERVAL = 5  # 秒
+# 远程服务器配置
+REMOTE_SSH_HOST = "your-remote-host"  # 远程服务器地址
+REMOTE_SSH_PORT = 22                  # SSH 端口
+REMOTE_SSH_USER = "your-username"     # SSH 用户名
+REMOTE_BASE_DIR = "/home/username"    # 远程工作目录
 ```
 
 ## CLI 命令
 
 ```bash
-ailabber help                    # 显示帮助
-ailabber whoami                  # 查看当前用户
-ailabber submit [local|remote] [config]  # 提交任务
-ailabber status <task_id>        # 查看任务状态
-ailabber list [status]           # 列出任务
-ailabber fetch <task_id> [dir]   # 下载结果
-ailabber cancel <task_id>        # 取消任务
+ailabber help                        # 显示帮助
+ailabber whoami                      # 查看当前用户
+
+# 三种任务提交方式
+ailabber run <config.toml>           # 直接调用本地 Slurm（不经过代理）
+ailabber submit local <config.toml>  # 通过代理提交到本地
+ailabber submit remote <config.toml> # 通过代理提交到远程
+
+ailabber status <task_id>            # 查看任务状态
+ailabber list [status]               # 列出任务
+ailabber fetch <task_id> [dir]       # 下载结果
+ailabber cancel <task_id>            # 取消任务
 ```
 
-## API 端点
+## 数据库
 
-### Local Proxy (localhost:8080)
+- **位置**: `~/.ailabber/local_proxy.db` (SQLite)
+- **仅在本地代理**: 数据库只存放在本地，远程服务器无状态
+- **表结构**:
+  - `users`: 用户信息
+  - `tasks`: 任务记录
+  - `message_log`: 消息日志
 
-| 方法 | 端点 | 说明 |
-|------|------|------|
-| POST | /api/submit | 提交任务 |
-| GET | /api/status/<task_id> | 获取任务状态 |
-| GET | /api/tasks | 列出用户任务 |
-| GET | /api/logs/<task_id> | 获取任务日志 |
-| GET | /api/fetch/<task_id> | 下载任务结果 |
-| POST | /api/cancel/<task_id> | 取消任务 |
-| GET | /health | 健康检查 |
+## 注意事项
 
-### Remote Server (远程:8080)
+1. **SSH 配置**: 远程提交需要配置无密码 SSH 登录
+2. **Slurm 环境**: 本地和远程都需要安装 Slurm (`sbatch`, `squeue`, `sacct`, `scancel`)
+3. **文件同步**: 远程提交会使用 `rsync` 同步文件
+4. **轮询间隔**: 默认 5 秒轮询一次远程任务状态
 
-| 方法 | 端点 | 说明 |
-|------|------|------|
-| POST | /api/submit | 提交 Slurm 作业 |
-| GET | /api/status/<slurm_job_id> | 查询作业状态 |
-| GET | /api/logs/<task_id> | 获取日志 |
-| GET | /api/fetch/<task_id> | 下载结果 |
-| POST | /api/cancel/<slurm_job_id> | 取消作业 |
-| GET | /health | 健康检查 |
+## License
 
-## 任务状态
-
-| 状态 | 说明 |
-|------|------|
-| pending | 等待中 |
-| running | 运行中 |
-| completed | 已完成 |
-| failed | 失败 |
-| canceled | 已取消 |
-
-## 目录结构
-
-```
-ailabber/
-├── client/
-│   ├── __init__.py
-│   └── cli.py              # 命令行客户端
-├── server/
-│   ├── __init__.py
-│   ├── local_proxy.py      # 本地代理服务器
-│   └── remote_server.py    # 远程服务器
-├── shared/
+MIT
 │   ├── __init__.py
 │   ├── config.py           # 配置常量
 │   ├── database.py         # 数据库模型
