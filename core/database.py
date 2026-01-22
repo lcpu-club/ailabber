@@ -11,7 +11,7 @@ import shortuuid
 from sqlalchemy import create_engine, String, Integer, Float, Text, DateTime
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, Session, sessionmaker
 
-from shared.config import LOCAL_DB_PATH, DATA_DIR
+from core.config import LOCAL_DB_PATH, DATA_DIR
 
 
 # ============ Base ============
