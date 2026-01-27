@@ -61,4 +61,18 @@ def run_app():
         polling_service.stop()
         logger.info("服务器已停止")
 
-run_app()
+
+def create_app_with_polling():
+    """创建Flask应用并启动轮询服务（用于gunicorn）"""
+    app = create_app()
+    
+    # 启动轮询服务
+    polling_service = get_polling_service()
+    polling_service.start()
+    logger.info("任务轮询服务已启动")
+    
+    return app
+
+
+if __name__ == '__main__':
+    run_app()

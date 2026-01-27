@@ -43,4 +43,6 @@ def run_app():
         threaded=True
     )
 
-run_app()
+
+if __name__ == '__main__':
+    run_app()

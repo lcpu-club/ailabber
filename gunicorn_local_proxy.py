@@ -1,6 +1,6 @@
 """
 Gunicorn配置文件 - Local Proxy 本地代理服务器
-运行命令: gunicorn -c gunicorn_local_proxy.py "server.local_proxy.app:create_app()"
+运行命令: gunicorn -c gunicorn_local_proxy.py "server.local_proxy.app:create_app_with_polling()"
 """
 from pathlib import Path
 
