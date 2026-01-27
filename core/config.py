@@ -14,7 +14,7 @@ LOG_LEVEL_FILE = DEBUG
 LOCAL_PROXY_URL = f"http://127.0.0.1:{LOCAL_PROXY_PORT}"
 SSH_PRIVATE_KEY = Path.home() / ".ssh" / "id_rsa"  # SSH 私钥路径
 
-# ============ 远程服务器配置 ============
+# ============ local->remote服务器配置 ============
 REMOTE_SSH_HOST = "1.1.1.1"          # 远程服务器地址
 REMOTE_SSH_PORT = 22                 # SSH 端口
 REMOTE_SSH_USER = "root"             # SSH 用户名
