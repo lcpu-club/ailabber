@@ -12,13 +12,13 @@ import argparse
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # 导入所有命令
-from cmd.whoami import cmd_whoami
-from cmd.submit import cmd_submit
-from cmd.status import cmd_status
-from cmd.list import cmd_list
-from cmd.fetch import cmd_fetch
-from cmd.cancel import cmd_cancel
-from cmd.local_run import cmd_local_run
+from aillaber_cmd.whoami import cmd_whoami
+from aillaber_cmd.submit import cmd_submit
+from aillaber_cmd.status import cmd_status
+from aillaber_cmd.list import cmd_list
+from aillaber_cmd.fetch import cmd_fetch
+from aillaber_cmd.cancel import cmd_cancel
+from aillaber_cmd.local_run import cmd_local_run
 
 current_username = os.environ.get('USER', 'unknown')
 
