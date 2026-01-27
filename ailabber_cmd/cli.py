@@ -34,7 +34,7 @@ def create_parser():
         epilog="See USAGE.md for detailed examples and usage patterns."
     )
     
-    subparsers = parser.add_subparsers(dest='command', help='Available commands')
+    subparsers = parser.add_subparsers(dest='subcommand', help='Available commands')
     
     # whoami
     parser_whoami = subparsers.add_parser('whoami', help='Show current user')
@@ -128,27 +128,35 @@ def main():
     
     args = parser.parse_args()
     
+    # 如果没有识别到命令，显示帮助并退出
+    if not args.subcommand:
+        parser.print_help()
+        sys.exit(1)
+    
     # 显示用户信息（除了 whoami 命令）
-    if args.command and args.command != 'whoami' and current_username != 'unknown':
+    if args.subcommand != 'whoami' and current_username != 'unknown':
         print(f"[{current_username}]")
     
     # 路由到对应的命令处理函数
-    if args.command == 'whoami':
+    if args.subcommand == 'whoami':
         cmd_whoami(args)
-    elif args.command == 'submit':
+    elif args.subcommand == 'submit':
         cmd_submit(args)
-    elif args.command == 'local-run':
+    elif args.subcommand == 'local-run':
         cmd_local_run(args)
-    elif args.command == 'status':
+    elif args.subcommand == 'status':
         cmd_status(args)
-    elif args.command == 'list':
+    elif args.subcommand == 'list':
         cmd_list(args)
-    elif args.command == 'fetch':
+    elif args.subcommand == 'fetch':
         cmd_fetch(args)
-    elif args.command == 'cancel':
+    elif args.subcommand == 'cancel':
         cmd_cancel(args)
     else:
+        # 不应该到达这里
+        print(f"Unknown command: {args.subcommand}")
         parser.print_help()
+        sys.exit(1)
 
 
 if __name__ == "__main__":
