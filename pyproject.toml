@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 [project.scripts]
-ailabber = "cmd.cli:main"
+ailabber = "ailabber_cmd.cli:main"
 
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
